@@ -9,6 +9,7 @@ import {
 } from "@/lib/time";
 
 const CANDIDATES_PER_TERMINUS = 3;
+const DETAIL_CANDIDATES_PER_TERMINUS = 2;
 const DEFAULT_LOOKAHEAD_MINUTES = 720;
 const TOKEN_REFRESH_BUFFER_MS = 60_000;
 const RTT_RESPONSE_CACHE_MS = 45_000;
@@ -112,14 +113,21 @@ export function usingMockRtt() {
   return getRttMode() === "mock";
 }
 
-export async function getCambridgeDepartures(terminus: Terminus) {
+type DepartureOptions = {
+  notBefore?: Date;
+};
+
+export async function getCambridgeDepartures(
+  terminus: Terminus,
+  options: DepartureOptions = {},
+) {
   const mode = getRttMode();
   if (mode === "mock") return mockDepartures(terminus);
-  if (mode === "basic") return getLegacyDepartures(terminus);
-  return getTokenDepartures(terminus);
+  if (mode === "basic") return getLegacyDepartures(terminus, options);
+  return getTokenDepartures(terminus, options);
 }
 
-async function getTokenDepartures(terminus: Terminus) {
+async function getTokenDepartures(terminus: Terminus, options: DepartureOptions) {
   const board = await rttTokenFetch<{ services?: RttLineupService[] }>("/gb-nr/location", {
     code: terminus.railCrs,
     filterTo: CAMBRIDGE_CRS,
@@ -130,10 +138,11 @@ async function getTokenDepartures(terminus: Terminus) {
   const candidates = (board.services ?? [])
     .filter((service) => service.scheduleMetadata?.inPassengerService !== false)
     .filter((service) => !service.temporalData?.departure?.isCancelled)
+    .filter((service) => isCatchableService(service, options.notBefore))
     .slice(0, CANDIDATES_PER_TERMINUS);
 
   const trains: (TrainOption | undefined)[] = [];
-  for (const service of candidates) {
+  for (const service of candidates.slice(0, DETAIL_CANDIDATES_PER_TERMINUS)) {
     trains.push(await enrichTokenService(service, terminus));
   }
 
@@ -149,13 +158,10 @@ async function enrichTokenService(
   const departure = pickTemporalDate(service.temporalData?.departure);
   if (!departure) return undefined;
 
-  const detail = await rttTokenFetch<RttServiceDetail>("/gb-nr/service", serviceParams(service));
-  const cambridge = detail.service?.locations?.find((location) => {
-    const shortCodes = location.location?.shortCodes ?? [];
-    const description = location.location?.description?.toLowerCase() ?? "";
-    return shortCodes.includes(CAMBRIDGE_CRS) || description === "cambridge";
-  });
-  const arrival = pickTemporalDate(cambridge?.temporalData?.arrival);
+  const boardCambridge = service.destination?.find(isCambridgeLocationPair);
+  const boardArrival = pickTemporalDate(boardCambridge?.temporalData);
+  const cambridge = boardArrival ? undefined : await getServiceCambridgeCall(service);
+  const arrival = boardArrival ?? pickTemporalDate(cambridge?.temporalData?.arrival);
   if (!arrival) return undefined;
 
   const delayMinutes =
@@ -185,13 +191,23 @@ async function enrichTokenService(
   } satisfies TrainOption;
 }
 
-async function getLegacyDepartures(terminus: Terminus) {
+async function getServiceCambridgeCall(service: RttLineupService) {
+  const detail = await rttTokenFetch<RttServiceDetail>("/gb-nr/service", serviceParams(service));
+  return detail.service?.locations?.find((location) => {
+    const shortCodes = location.location?.shortCodes ?? [];
+    const description = location.location?.description?.toLowerCase() ?? "";
+    return shortCodes.includes(CAMBRIDGE_CRS) || description === "cambridge";
+  });
+}
+
+async function getLegacyDepartures(terminus: Terminus, options: DepartureOptions) {
   const board = await rttLegacyFetch<{ services?: LegacyBoardService[] }>(
     `/json/search/${terminus.railCrs}/to/${CAMBRIDGE_CRS}`,
   );
 
   const services = (board.services ?? [])
     .filter((service) => service.locationDetail?.displayAs !== "CANCELLED_CALL")
+    .filter((service) => isCatchableLegacyService(service, options.notBefore))
     .slice(0, CANDIDATES_PER_TERMINUS);
 
   const trains = await Promise.all(
@@ -376,6 +392,28 @@ function pickTemporalDate(temporal?: RttTemporal) {
       temporal?.scheduleAdvertised ??
       temporal?.scheduleInternal,
   );
+}
+
+function isCatchableService(service: RttLineupService, notBefore?: Date) {
+  if (!notBefore) return true;
+  const departure = pickTemporalDate(service.temporalData?.departure);
+  return Boolean(departure && departure.getTime() >= notBefore.getTime());
+}
+
+function isCatchableLegacyService(service: LegacyBoardService, notBefore?: Date) {
+  if (!notBefore || !service.runDate) return true;
+  const departure = parseLegacyTime(
+    service.runDate,
+    service.locationDetail?.realtimeDeparture ?? service.locationDetail?.gbttBookedDeparture,
+    notBefore,
+  );
+  return Boolean(departure && departure.getTime() >= notBefore.getTime());
+}
+
+function isCambridgeLocationPair(pair: RttLocationPair) {
+  const shortCodes = pair.location?.shortCodes ?? [];
+  const description = pair.location?.description?.toLowerCase() ?? "";
+  return shortCodes.includes(CAMBRIDGE_CRS) || description === "cambridge";
 }
 
 function serviceParams(service: RttLineupService) {

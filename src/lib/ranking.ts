@@ -47,7 +47,17 @@ export async function buildRoutes(input: BuildInput): Promise<RoutesResponse> {
   }
 
   const trainSettled = await Promise.allSettled(
-    TERMINI.map(async (terminus) => [terminus.id, await getCambridgeDepartures(terminus)] as const),
+    TERMINI.map(async (terminus) => {
+      const access = accessByTerminus.get(terminus.id);
+      const readyAt = access
+        ? addMinutes(new Date(access.arrivalTime), terminus.interchangeMinutes)
+        : undefined;
+
+      return [
+        terminus.id,
+        await getCambridgeDepartures(terminus, { notBefore: readyAt }),
+      ] as const;
+    }),
   );
   const trainsByTerminus = new Map<string, TrainOption[]>();
   for (const result of trainSettled) {
