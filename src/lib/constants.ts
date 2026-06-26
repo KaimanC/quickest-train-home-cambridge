@@ -10,6 +10,12 @@ export type Terminus = {
   tflStopName: string;
   interchangeMinutes: number;
   interchangeNote: string;
+  /**
+   * A mid-route stop (also on the Tube) that Cambridge trains call at, rather
+   * than a central London terminus. Only worth boarding here when reaching it
+   * beats every central terminus, so these are gated by access time.
+   */
+  intermediate?: boolean;
 };
 
 export const TERMINI: Terminus[] = [
@@ -48,6 +54,22 @@ export const TERMINI: Terminus[] = [
     tflStopName: "Liverpool Street Underground Station",
     interchangeMinutes: 6,
     interchangeNote: "Underground platforms to Liverpool Street mainline concourse.",
+  },
+];
+
+// Tube stations that Cambridge trains call at mid-route. For someone already
+// near one of these, boarding here can beat trekking to a central terminus —
+// it's the same train, so the only thing that changes is the London access leg.
+export const INTERMEDIATE_RAILHEADS: Terminus[] = [
+  {
+    id: "finsbury-park",
+    name: "Finsbury Park",
+    railCrs: "FPK",
+    tflStopId: "940GZZLUFPK",
+    tflStopName: "Finsbury Park Underground Station",
+    interchangeMinutes: 4,
+    interchangeNote: "Victoria/Piccadilly line platforms to Finsbury Park National Rail platforms.",
+    intermediate: true,
   },
 ];
 

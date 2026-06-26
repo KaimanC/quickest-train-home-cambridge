@@ -6,7 +6,7 @@ import type {
   Station,
   TrainOption,
 } from "@/app/types";
-import { ASSUMPTIONS, TERMINI } from "@/lib/constants";
+import { ASSUMPTIONS, INTERMEDIATE_RAILHEADS, TERMINI } from "@/lib/constants";
 import type { TflOrigin } from "@/lib/tfl";
 import { getAccessJourney, getNearestTubeStation } from "@/lib/tfl";
 import { getCambridgeDepartures, usingMockRtt } from "@/lib/rtt";
@@ -15,6 +15,14 @@ import { addMinutes, minutesBetween, toIso } from "@/lib/time";
 type BuildInput =
   | { kind: "coordinates"; lat: number; lon: number; when?: string }
   | { kind: "station"; stationId: string; stationName: string; when?: string };
+
+const ALL_RAILHEADS = [...TERMINI, ...INTERMEDIATE_RAILHEADS];
+
+// An intermediate railhead is only worth a Realtime Trains query when you can
+// be ready on its platform no later than this past the fastest central
+// terminus. The slack covers the few minutes a mid-route stop departs after
+// the terminus, so a near-tie still surfaces as the lower-effort option.
+const INTERMEDIATE_READY_TOLERANCE_MS = 5 * 60_000;
 
 export async function buildRoutes(input: BuildInput): Promise<RoutesResponse> {
   // Treat the chosen depart-at time (if any) as "now" for planning. TfL and RTT
@@ -57,7 +65,7 @@ export async function buildRoutes(input: BuildInput): Promise<RoutesResponse> {
   const tflOrigin = toTflOrigin(input, nearestStation);
 
   const accessSettled = await Promise.allSettled(
-    TERMINI.map(
+    ALL_RAILHEADS.map(
       async (terminus) =>
         [terminus.id, await getAccessJourney(tflOrigin, terminus, departAt)] as const,
     ),
@@ -71,12 +79,36 @@ export async function buildRoutes(input: BuildInput): Promise<RoutesResponse> {
     accessByTerminus.set(result.value[0], result.value[1]);
   }
 
+  const readyByTerminus = new Map<string, Date>();
+  for (const railhead of ALL_RAILHEADS) {
+    const access = accessByTerminus.get(railhead.id);
+    if (access) {
+      readyByTerminus.set(
+        railhead.id,
+        addMinutes(new Date(access.arrivalTime), railhead.interchangeMinutes),
+      );
+    }
+  }
+
+  // Earliest you could be ready at any central terminus. Intermediate railheads
+  // (e.g. Finsbury Park) are only queried when reaching them isn't slower than
+  // this, so we don't spend Realtime Trains calls on a detour that can't win.
+  const centralReadyTimes = TERMINI.map((t) => readyByTerminus.get(t.id)?.getTime()).filter(
+    (value): value is number => value != null,
+  );
+  const bestCentralReady = centralReadyTimes.length ? Math.min(...centralReadyTimes) : undefined;
+
+  const railheadsToQuery = ALL_RAILHEADS.filter((railhead) => {
+    if (!railhead.intermediate) return true;
+    const ready = readyByTerminus.get(railhead.id);
+    if (!ready) return false;
+    if (bestCentralReady == null) return true;
+    return ready.getTime() <= bestCentralReady + INTERMEDIATE_READY_TOLERANCE_MS;
+  });
+
   const trainSettled = await Promise.allSettled(
-    TERMINI.map(async (terminus) => {
-      const access = accessByTerminus.get(terminus.id);
-      const readyAt = access
-        ? addMinutes(new Date(access.arrivalTime), terminus.interchangeMinutes)
-        : undefined;
+    railheadsToQuery.map(async (terminus) => {
+      const readyAt = readyByTerminus.get(terminus.id);
 
       return [
         terminus.id,
@@ -93,9 +125,9 @@ export async function buildRoutes(input: BuildInput): Promise<RoutesResponse> {
     trainsByTerminus.set(result.value[0], result.value[1]);
   }
 
-  const candidates: Omit<RankedRoute, "rank">[] = [];
+  const candidates: { route: Omit<RankedRoute, "rank">; latestLeaveByMs: number }[] = [];
 
-  for (const terminus of TERMINI) {
+  for (const terminus of ALL_RAILHEADS) {
     const access = accessByTerminus.get(terminus.id);
     const trains = trainsByTerminus.get(terminus.id) ?? [];
     if (!access) continue;
@@ -113,32 +145,50 @@ export async function buildRoutes(input: BuildInput): Promise<RoutesResponse> {
       const leaveBy = latestLeaveBy.getTime() < now.getTime() ? now : latestLeaveBy;
 
       candidates.push({
-        terminus: {
-          id: terminus.id,
-          name: terminus.name,
-          railCrs: terminus.railCrs,
-          interchangeMinutes: terminus.interchangeMinutes,
-          interchangeNote: terminus.interchangeNote,
+        latestLeaveByMs: latestLeaveBy.getTime(),
+        route: {
+          terminus: {
+            id: terminus.id,
+            name: terminus.name,
+            railCrs: terminus.railCrs,
+            interchangeMinutes: terminus.interchangeMinutes,
+            interchangeNote: terminus.interchangeNote,
+          },
+          access,
+          train,
+          readyAt: toIso(readyAt),
+          leaveBy: toIso(leaveBy),
+          arrivalTime: train.arrivalTime,
+          totalMinutes: minutesBetween(now, new Date(train.arrivalTime)),
+          warnings: access.statusMessages,
         },
-        access,
-        train,
-        readyAt: toIso(readyAt),
-        leaveBy: toIso(leaveBy),
-        arrivalTime: train.arrivalTime,
-        totalMinutes: minutesBetween(now, new Date(train.arrivalTime)),
-        warnings: access.statusMessages,
       });
     }
   }
 
-  const routes = candidates
+  // The same physical train can be boardable from several railheads (a King's
+  // Cross train also calls at Finsbury Park; a Thameslink calls at both St
+  // Pancras and Farringdon). Keep only the least-effort boarding point per
+  // train — the one you can leave by latest — so the easier option wins instead
+  // of the central terminus always shading it on the earliest-departure tie.
+  const bestByTrain = new Map<string, (typeof candidates)[number]>();
+  for (const candidate of candidates) {
+    const key = candidate.route.train.serviceId;
+    const existing = bestByTrain.get(key);
+    if (!existing || candidate.latestLeaveByMs > existing.latestLeaveByMs) {
+      bestByTrain.set(key, candidate);
+    }
+  }
+
+  const routes = [...bestByTrain.values()]
     .sort((a, b) => {
-      const arrivalDelta = Date.parse(a.arrivalTime) - Date.parse(b.arrivalTime);
+      const arrivalDelta = Date.parse(a.route.arrivalTime) - Date.parse(b.route.arrivalTime);
       if (arrivalDelta !== 0) return arrivalDelta;
-      return Date.parse(a.train.departureTime) - Date.parse(b.train.departureTime);
+      // Same arrival: prefer the boarding point you can leave for latest.
+      return b.latestLeaveByMs - a.latestLeaveByMs;
     })
     .slice(0, 3)
-    .map((route, index) => ({ ...route, rank: index + 1 }));
+    .map(({ route }, index) => ({ ...route, rank: index + 1 }));
 
   if (!routes.length && !errors.length) {
     errors.push("No catchable Cambridge trains were found in the next three hours.");

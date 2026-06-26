@@ -130,12 +130,21 @@ export async function getCambridgeDepartures(
 }
 
 async function getTokenDepartures(terminus: Terminus, options: DepartureOptions) {
-  const board = await rttTokenFetch<{ services?: RttLineupService[] }>("/gb-nr/location", {
+  const params: Record<string, string | undefined> = {
     code: terminus.railCrs,
     filterTo: CAMBRIDGE_CRS,
-    timeWindow: rttLookaheadMinutes(options.searchTime).toString(),
+    timeWindow: rttLookaheadMinutes().toString(),
     timeTolerance: "true",
-  });
+  };
+
+  // The API caps timeWindow at 23h59m, so a future depart-at time can't be
+  // reached by widening the window from "now". Anchor the board at that time
+  // with timeFrom instead and keep timeWindow at its normal lookahead.
+  if (options.searchTime && options.searchTime.getTime() > Date.now()) {
+    params.timeFrom = toIso(options.searchTime);
+  }
+
+  const board = await rttTokenFetch<{ services?: RttLineupService[] }>("/gb-nr/location", params);
 
   const candidates = (board.services ?? [])
     .filter((service) => service.scheduleMetadata?.inPassengerService !== false)
@@ -379,22 +388,18 @@ function getRttMode(): RttMode {
   return "mock";
 }
 
-const MAX_LOOKAHEAD_MINUTES = 1_440;
+// The API rejects a query duration of 24h or more ("maximum query duration is
+// 23 hours 59 minutes"), so cap one minute below that.
+const MAX_LOOKAHEAD_MINUTES = 1_439;
 
-function rttLookaheadMinutes(searchTime?: Date) {
+function rttLookaheadMinutes() {
   const configured = Number(process.env.RTT_LOOKAHEAD_MINUTES);
   const base =
     Number.isFinite(configured) && configured > 0
       ? Math.round(configured)
       : DEFAULT_LOOKAHEAD_MINUTES;
 
-  // The board window is measured from "now", so a future depart time needs the
-  // gap from now until then added on so those services are still in range.
-  const aheadMinutes = searchTime
-    ? Math.max(0, Math.round((searchTime.getTime() - Date.now()) / 60_000))
-    : 0;
-
-  return Math.min(MAX_LOOKAHEAD_MINUTES, base + aheadMinutes);
+  return Math.min(MAX_LOOKAHEAD_MINUTES, base);
 }
 
 function pickTemporalDate(temporal?: RttTemporal) {
